@@ -50,6 +50,8 @@ func main() {
 		err = authCmd(os.Args[2:])
 	case "projects", "project":
 		err = projectsCmd(os.Args[2:])
+	case "isolation":
+		err = isolationCmd(os.Args[2:])
 	case "configure":
 		err = configureCmd(os.Args[2:])
 	case "iam":
@@ -79,6 +81,9 @@ func usage() {
   mimir projects create NAME [--member EMAIL ...] [--cpu 4] [--memory 8Gi] [--pods 20]
   mimir projects list
   mimir projects delete NAME
+  mimir isolation show             Report the live isolation budget, media-stack floor, and GPU leaks
+  mimir isolation verify [--policy FILE]   Assert the isolation invariants (non-zero exit on breach; CI gate)
+  mimir isolation plan|apply [--dir DIR] [-- ARGS]   Drive the tofu/isolation module
   mimir configure [--server URL] [--server-ca FILE] [--oidc-issuer URL] [--oidc-client-id ID] [--oidc-ca FILE] [--insecure] [--access]
   mimir version
 
@@ -261,6 +266,16 @@ func (c Config) oidc() *http.Client {
 
 // requireConfig gives a clear message when the (deliberately un-defaulted) endpoints aren't set yet.
 func (c Config) requireConfig(needServer bool) error {
+	if c.Access {
+		// Access-as-identity: the Cloudflare Access JWT is the k8s bearer (see validToken/k8sReq), so no
+		// OIDC issuer is needed off-LAN — only the server. Requiring the issuer here wrongly blocked
+		// `mimir projects *` in --access mode even though the API calls never touch Dex.
+		if needServer && c.Server == "" {
+			return fmt.Errorf("not configured — run `mimir configure --server <url> --access` " +
+				"(or set MIMIR_SERVER)")
+		}
+		return nil
+	}
 	if c.OIDCIssuer == "" || (needServer && c.Server == "") {
 		return fmt.Errorf("not configured — run `mimir configure --server <url> --oidc-issuer <url> " +
 			"[--server-ca FILE --oidc-ca FILE]` (or set MIMIR_SERVER / MIMIR_OIDC_ISSUER)")
@@ -575,9 +590,9 @@ func projectsCmd(args []string) error {
 		}
 		var l struct {
 			Items []struct {
-				Metadata struct{ Name string } `json:"metadata"`
+				Metadata struct{ Name string }        `json:"metadata"`
 				Spec     struct{ DisplayName string } `json:"spec"`
-				Status   struct{ State string } `json:"status"`
+				Status   struct{ State string }       `json:"status"`
 			} `json:"items"`
 		}
 		_ = json.Unmarshal(b, &l)
@@ -646,7 +661,9 @@ func projectsCreate(c Config, args []string) error {
 }
 
 func apiErr(b []byte, code int) error {
-	var s struct{ Message string `json:"message"` }
+	var s struct {
+		Message string `json:"message"`
+	}
 	_ = json.Unmarshal(b, &s)
 	if s.Message != "" {
 		return fmt.Errorf("api error %d: %s", code, s.Message)
