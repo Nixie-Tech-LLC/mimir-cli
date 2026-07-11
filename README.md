@@ -24,7 +24,7 @@ curl -fsSL https://raw.githubusercontent.com/Nixie-Tech-LLC/mimir-cli/main/insta
 
 **Go:**
 ```sh
-go install github.com/Nixie-Tech-LLC/mimir-cli@latest
+go install github.com/Nixie-Tech-LLC/mimir-cli/cmd/mimir@latest
 ```
 
 **Manual (all OSes):** download an archive from
@@ -67,7 +67,7 @@ users:
 
 ## Build from source
 ```sh
-git clone https://github.com/Nixie-Tech-LLC/mimir-cli && cd mimir-cli && go build -o mimir .
+git clone https://github.com/Nixie-Tech-LLC/mimir-cli && cd mimir-cli && go build -o mimir ./cmd/mimir
 ```
 Stdlib-only — no external dependencies. Releases are cut with `vX.Y.Z` tags; cross-platform archives +
 `checksums.txt` are published to GitHub Releases.
