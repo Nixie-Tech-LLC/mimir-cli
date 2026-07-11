@@ -1,5 +1,5 @@
 #!/usr/bin/env sh
-# Install the mimir CLI on Linux/macOS. Downloads the latest `cli/v*` release binary from GitHub.
+# Install the mimir CLI on Linux/macOS. Downloads the latest release binary from GitHub.
 #   curl -fsSL https://raw.githubusercontent.com/Nixie-Tech-LLC/mimir-cli/main/install.sh | sh
 # Override: MIMIR_VERSION=v0.2.0  INSTALL_DIR=~/.local/bin  sh install.sh
 set -eu
@@ -12,15 +12,14 @@ case "$os" in linux|darwin) ;; *) echo "unsupported OS: $os (use Scoop on Window
 arch=$(uname -m)
 case "$arch" in x86_64|amd64) arch=amd64;; aarch64|arm64) arch=arm64;; *) echo "unsupported arch: $arch"; exit 1;; esac
 
-# resolve the latest cli/v* tag (the repo may hold non-CLI releases too)
 if [ "${MIMIR_VERSION:-}" != "" ]; then
-  tag="$MIMIR_VERSION"; case "$tag" in cli/*) ;; *) tag="cli/$tag";; esac
+  tag="$MIMIR_VERSION"; case "$tag" in v*) ;; *) tag="v$tag";; esac
 else
-  tag=$(curl -fsSL "https://api.github.com/repos/$REPO/releases?per_page=30" \
-    | grep -o '"tag_name": *"cli/[^"]*"' | head -1 | sed 's/.*"cli\//cli\//;s/"//')
+  tag=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" \
+    | grep -o '"tag_name": *"[^"]*"' | head -1 | sed 's/.*: *"//;s/"//')
 fi
-[ -n "$tag" ] || { echo "no cli/v* release found"; exit 1; }
-ver=${tag#cli/}; ver=${ver#v}
+[ -n "$tag" ] || { echo "no release found for $REPO"; exit 1; }
+ver=${tag#v}
 
 asset="mimir_${ver}_${os}_${arch}.tar.gz"
 url="https://github.com/$REPO/releases/download/$tag/$asset"
