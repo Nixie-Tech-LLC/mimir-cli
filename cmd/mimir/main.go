@@ -36,6 +36,7 @@ type Config struct {
 	OIDCClientID string `json:"oidcClientID"` // mimir-cli
 	OIDCCA       string `json:"oidcCA"`       // PEM that signs Dex's cert (mimir-ca)
 	Insecure     bool   `json:"insecure"`     // skip TLS verify (dev only)
+	Access       bool   `json:"access"`       // server is behind Cloudflare Access (send a cf-access-token)
 }
 
 func main() {
@@ -78,7 +79,7 @@ func usage() {
   mimir projects create NAME [--member EMAIL ...] [--cpu 4] [--memory 8Gi] [--pods 20]
   mimir projects list
   mimir projects delete NAME
-  mimir configure [--server URL] [--server-ca FILE] [--oidc-issuer URL] [--oidc-client-id ID] [--oidc-ca FILE] [--insecure]
+  mimir configure [--server URL] [--server-ca FILE] [--oidc-issuer URL] [--oidc-client-id ID] [--oidc-ca FILE] [--insecure] [--access]
   mimir version
 
 Config: ~/.mimir/config.json (or env MIMIR_SERVER, MIMIR_SERVER_CA_FILE, MIMIR_OIDC_ISSUER,
@@ -123,7 +124,35 @@ func loadConfig() Config {
 	if os.Getenv("MIMIR_INSECURE") == "1" {
 		c.Insecure = true
 	}
+	if os.Getenv("MIMIR_ACCESS") == "1" {
+		c.Access = true
+	}
 	return c
+}
+
+// accessToken returns a Cloudflare Access token for the server app, so requests pass the identity-aware
+// proxy in front of the k8s API. Uses cloudflared (the standard CF tool); logs in once if needed.
+func accessToken(server string) (string, error) {
+	if _, err := exec.LookPath("cloudflared"); err != nil {
+		return "", fmt.Errorf("server is behind Cloudflare Access but `cloudflared` isn't installed " +
+			"(brew/scoop/apt install cloudflared) — or run `mimir configure --no-access` on-LAN")
+	}
+	get := func() string {
+		out, _ := exec.Command("cloudflared", "access", "token", "--app="+server).Output()
+		return strings.TrimSpace(string(out))
+	}
+	if t := get(); t != "" && !strings.Contains(t, "Unable") {
+		return t, nil
+	}
+	// no cached token — do the SSO login (interactive, once), then re-fetch
+	fmt.Fprintln(os.Stderr, "Cloudflare Access: opening SSO login…")
+	login := exec.Command("cloudflared", "access", "login", server)
+	login.Stdout, login.Stderr = os.Stderr, os.Stderr
+	_ = login.Run()
+	if t := get(); t != "" {
+		return t, nil
+	}
+	return "", fmt.Errorf("could not obtain a Cloudflare Access token for %s", server)
 }
 
 func configureCmd(args []string) error {
@@ -151,6 +180,10 @@ func configureCmd(args []string) error {
 			c.OIDCCA = string(b)
 		case "--insecure":
 			c.Insecure = true
+		case "--access":
+			c.Access = true
+		case "--no-access":
+			c.Access = false
 		}
 	}
 	if err := os.MkdirAll(mimirDir(), 0o700); err != nil {
@@ -201,7 +234,30 @@ type tokenCache struct {
 	Expiry       time.Time `json:"expiry"`
 }
 
-func (c Config) oidc() *http.Client { return httpClient(c.OIDCCA, c.Insecure) }
+// accessRT injects a Cloudflare Access token so requests to an Access-gated host (Dex) pass the IAP.
+type accessRT struct {
+	base http.RoundTripper
+	app  string
+}
+
+func (a accessRT) RoundTrip(r *http.Request) (*http.Response, error) {
+	if t, err := accessToken(a.app); err == nil && t != "" {
+		r.Header.Set("cf-access-token", t)
+	}
+	return a.base.RoundTrip(r)
+}
+
+func (c Config) oidc() *http.Client {
+	cl := httpClient(c.OIDCCA, c.Insecure)
+	if c.Access { // Dex is behind Cloudflare Access — inject the Access token on every OIDC request
+		base := cl.Transport
+		if base == nil {
+			base = http.DefaultTransport
+		}
+		cl.Transport = accessRT{base: base, app: strings.TrimRight(c.OIDCIssuer, "/")}
+	}
+	return cl
+}
 
 // requireConfig gives a clear message when the (deliberately un-defaulted) endpoints aren't set yet.
 func (c Config) requireConfig(needServer bool) error {
@@ -241,6 +297,25 @@ func authCmd(args []string) error {
 }
 
 func authLogin(c Config) error {
+	if c.Access {
+		// Remote via Cloudflare Access: the Access login IS the k8s identity — no Dex device flow needed.
+		if _, err := exec.LookPath("cloudflared"); err != nil {
+			return fmt.Errorf("install cloudflared, then: cloudflared access login %s", c.Server)
+		}
+		login := exec.Command("cloudflared", "access", "login", c.Server)
+		login.Stdout, login.Stderr, login.Stdin = os.Stderr, os.Stderr, os.Stdin
+		if err := login.Run(); err != nil {
+			return err
+		}
+		tok, err := accessToken(c.Server)
+		if err != nil {
+			return err
+		}
+		if _, claims, e := decodeJWT(tok); e == nil {
+			fmt.Printf("Logged in as %v via Cloudflare Access.\n", claims["email"])
+		}
+		return nil
+	}
 	if err := c.requireConfig(false); err != nil {
 		return err
 	}
@@ -330,6 +405,11 @@ func loadToken() (tokenCache, error) {
 
 // validToken returns a non-expired id_token, refreshing via refresh_token if needed.
 func validToken(c Config) (string, error) {
+	if c.Access {
+		// Access-as-identity: the Cloudflare Access JWT (email claim) is the k8s bearer; the apiserver
+		// trusts heekaism.cloudflareaccess.com as an OIDC issuer. cloudflared handles refresh.
+		return accessToken(c.Server)
+	}
 	tc, err := loadToken()
 	if err != nil {
 		return "", err
@@ -453,10 +533,17 @@ func k8sReq(c Config, method, path string, body []byte) ([]byte, int, error) {
 	if err != nil {
 		return nil, 0, err
 	}
-	req.Header.Set("Authorization", "Bearer "+tok)
+	req.Header.Set("Authorization", "Bearer "+tok) // Dex token -> k8s RBAC (rides through Access untouched)
 	req.Header.Set("Accept", "application/json")
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
+	}
+	if c.Access { // identity-aware proxy in front of the API: a separate header, so it stacks with the bearer
+		at, err := accessToken(c.Server)
+		if err != nil {
+			return nil, 0, err
+		}
+		req.Header.Set("cf-access-token", at)
 	}
 	resp, err := httpClient(c.ServerCA, c.Insecure).Do(req)
 	if err != nil {

@@ -43,6 +43,18 @@ mimir configure \
 Env equivalents: `MIMIR_SERVER`, `MIMIR_SERVER_CA_FILE`, `MIMIR_OIDC_ISSUER`, `MIMIR_OIDC_CLIENT_ID`,
 `MIMIR_OIDC_CA_FILE`, `MIMIR_INSECURE=1` (dev/self-signed).
 
+### Remote access (through Cloudflare Access)
+Off-LAN, the platform API is fronted by Cloudflare Access (identity-aware proxy). Install
+[`cloudflared`](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/),
+then configure the public endpoint with `--access`:
+```sh
+mimir configure --server https://k8s.yourteam.example --access
+mimir auth login          # opens your Access SSO — that login IS your k8s identity
+mimir projects create …
+```
+With `--access` (or `MIMIR_ACCESS=1`) the CLI obtains your Cloudflare Access token via `cloudflared` and uses it
+both to pass the edge and as your k8s bearer — no separate device flow, no `--oidc-*`, no CA needed (public cert).
+
 ## Use
 
 ```sh
