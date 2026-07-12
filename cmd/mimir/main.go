@@ -81,6 +81,9 @@ func usage() {
   mimir projects create NAME [--member EMAIL ...] [--cpu 4] [--memory 8Gi] [--pods 20]
   mimir projects list
   mimir projects delete NAME
+  mimir projects members NAME                       Show who has admin access to a project
+  mimir projects members add NAME EMAIL ...         Grant admin access
+  mimir projects members remove NAME EMAIL ...      Revoke admin access
   mimir isolation show             Report the live isolation budget, media-stack floor, and GPU leaks
   mimir isolation verify [--policy FILE]   Assert the isolation invariants (non-zero exit on breach; CI gate)
   mimir isolation plan|apply [--dir DIR] [-- ARGS]   Drive the tofu/isolation module
@@ -500,6 +503,24 @@ func authWhoami(c Config) error {
 	return nil
 }
 
+// callerID returns the caller's own k8s username (mimir:<email>) from their current token, used to make the
+// creator a member of the projects they create.
+func callerID(c Config) (string, error) {
+	tok, err := validToken(c)
+	if err != nil {
+		return "", err
+	}
+	_, claims, err := decodeJWT(tok)
+	if err != nil {
+		return "", err
+	}
+	email, _ := claims["email"].(string)
+	if email == "" {
+		return "", fmt.Errorf("no email claim in token")
+	}
+	return normMember(email), nil
+}
+
 func decodeJWT(tok string) (map[string]any, map[string]any, error) {
 	parts := strings.Split(tok, ".")
 	if len(parts) < 2 {
@@ -540,6 +561,11 @@ func openBrowser(u string) {
 // ---- k8s REST (projects.kro.run) --------------------------------------------
 
 func k8sReq(c Config, method, path string, body []byte) ([]byte, int, error) {
+	return k8sReqCT(c, method, path, body, "application/json")
+}
+
+// k8sReqCT is k8sReq with an explicit request Content-Type (e.g. application/merge-patch+json for PATCH).
+func k8sReqCT(c Config, method, path string, body []byte, contentType string) ([]byte, int, error) {
 	tok, err := validToken(c)
 	if err != nil {
 		return nil, 0, err
@@ -551,7 +577,7 @@ func k8sReq(c Config, method, path string, body []byte) ([]byte, int, error) {
 	req.Header.Set("Authorization", "Bearer "+tok) // Dex token -> k8s RBAC (rides through Access untouched)
 	req.Header.Set("Accept", "application/json")
 	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Content-Type", contentType)
 	}
 	if c.Access { // identity-aware proxy in front of the API: a separate header, so it stacks with the bearer
 		at, err := accessToken(c.Server)
@@ -616,8 +642,132 @@ func projectsCmd(args []string) error {
 		return nil
 	case "create":
 		return projectsCreate(c, args[1:])
+	case "members":
+		return projectsMembers(c, args[1:])
 	}
 	return fmt.Errorf("unknown projects subcommand %q", args[0])
+}
+
+// normMember canonicalizes an email/user to the k8s username the apiserver assigns Access + Dex identities:
+// the `email` claim with a `mimir:` prefix (see the apiserver AuthenticationConfiguration). RoleBinding
+// subjects must match this exactly, so `--member omar@onnixi.com` and `mimir:omar@onnixi.com` are the same.
+func normMember(s string) string {
+	return "mimir:" + strings.TrimPrefix(strings.TrimSpace(s), "mimir:")
+}
+
+// dispMember is the inverse of normMember for display (drops the mimir: prefix).
+func dispMember(s string) string { return strings.TrimPrefix(s, "mimir:") }
+
+// addMembers returns cur ∪ add (order-stable, deduped, normalized).
+func addMembers(cur, add []string) []string {
+	seen := map[string]bool{}
+	out := []string{}
+	for _, m := range cur {
+		if m = normMember(m); !seen[m] {
+			seen[m] = true
+			out = append(out, m)
+		}
+	}
+	for _, a := range add {
+		if m := normMember(a); !seen[m] {
+			seen[m] = true
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// removeMembers returns cur \ remove (order-stable, normalized).
+func removeMembers(cur, remove []string) []string {
+	drop := map[string]bool{}
+	for _, r := range remove {
+		drop[normMember(r)] = true
+	}
+	out := []string{}
+	for _, m := range cur {
+		if m = normMember(m); !drop[m] {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+func projectMembers(c Config, name string) ([]string, error) {
+	b, code, err := k8sReq(c, "GET", projPath+"/"+name, nil)
+	if err != nil {
+		return nil, err
+	}
+	if code >= 300 {
+		return nil, apiErr(b, code)
+	}
+	var p struct {
+		Spec struct {
+			Members []string `json:"members"`
+		} `json:"spec"`
+	}
+	if err := json.Unmarshal(b, &p); err != nil {
+		return nil, err
+	}
+	return p.Spec.Members, nil
+}
+
+// setProjectMembers PATCHes spec.members; kro re-renders the namespace admin RoleBinding from it. A JSON
+// merge patch replaces the array wholesale, which is exactly the desired list we compute client-side.
+func setProjectMembers(c Config, name string, members []string) error {
+	patch, _ := json.Marshal(map[string]any{"spec": map[string]any{"members": members}})
+	b, code, err := k8sReqCT(c, "PATCH", projPath+"/"+name, patch, "application/merge-patch+json")
+	if err != nil {
+		return err
+	}
+	if code >= 300 {
+		return apiErr(b, code)
+	}
+	return nil
+}
+
+func printMembers(members []string) {
+	if len(members) == 0 {
+		fmt.Println("(no members)")
+		return
+	}
+	for _, m := range members {
+		fmt.Println(dispMember(m))
+	}
+}
+
+func projectsMembers(c Config, args []string) error {
+	usage := "usage: mimir projects members NAME | members add NAME EMAIL... | members remove NAME EMAIL..."
+	if len(args) == 0 {
+		return fmt.Errorf(usage)
+	}
+	switch args[0] {
+	case "add", "remove":
+		if len(args) < 3 {
+			return fmt.Errorf("usage: mimir projects members %s NAME EMAIL...", args[0])
+		}
+		name, emails := args[1], args[2:]
+		cur, err := projectMembers(c, name)
+		if err != nil {
+			return err
+		}
+		next := addMembers(cur, emails)
+		if args[0] == "remove" {
+			next = removeMembers(cur, emails)
+		}
+		if err := setProjectMembers(c, name, next); err != nil {
+			return err
+		}
+		fmt.Printf("project %q now has %d member(s):\n", name, len(next))
+		printMembers(next)
+		return nil
+	default: // list: args[0] is the project name
+		cur, err := projectMembers(c, args[0])
+		if err != nil {
+			return err
+		}
+		printMembers(cur)
+		return nil
+	}
 }
 
 func projectsCreate(c Config, args []string) error {
@@ -631,7 +781,7 @@ func projectsCreate(c Config, args []string) error {
 		next := func() string { i++; return args[i] }
 		switch args[i] {
 		case "--member":
-			members = append(members, "mimir:"+strings.TrimPrefix(next(), "mimir:"))
+			members = append(members, normMember(next()))
 		case "--cpu":
 			cpu = next()
 		case "--memory":
@@ -639,6 +789,11 @@ func projectsCreate(c Config, args []string) error {
 		case "--pods":
 			pods = next()
 		}
+	}
+	// Auto-add the caller so the creator is admin in their own namespace (the RGD binds members -> admin;
+	// it does not bind the creator otherwise). Best-effort: if identity can't be resolved, don't block.
+	if self, err := callerID(c); err == nil && self != "" {
+		members = addMembers(members, []string{self})
 	}
 	proj := map[string]any{
 		"apiVersion": "kro.run/v1alpha1", "kind": "Project",
