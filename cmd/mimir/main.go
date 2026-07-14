@@ -78,9 +78,10 @@ func usage() {
   mimir auth get-token             Print an ExecCredential (used by kubeconfig; auto-refreshes)
   mimir auth whoami                Show your identity + groups from the token
   mimir auth logout                Delete the cached token
-  mimir projects create NAME [--member EMAIL ...] [--cpu 4] [--memory 8Gi] [--pods 20]
+  mimir projects create NAME [--guarded] [--member EMAIL ...] [--cpu 4] [--memory 8Gi] [--pods 20]
   mimir projects list
   mimir projects delete NAME
+  mimir projects guard NAME [--off]                 Toggle hard tenancy: Kata-enforced, PSA restricted, egress-locked
   mimir projects members NAME                       Show who has admin access to a project
   mimir projects members add NAME EMAIL ...         Grant admin access
   mimir projects members remove NAME EMAIL ...      Revoke admin access
@@ -644,6 +645,8 @@ func projectsCmd(args []string) error {
 		return projectsCreate(c, args[1:])
 	case "members":
 		return projectsMembers(c, args[1:])
+	case "guard":
+		return projectsGuard(c, args[1:])
 	}
 	return fmt.Errorf("unknown projects subcommand %q", args[0])
 }
@@ -772,10 +775,11 @@ func projectsMembers(c Config, args []string) error {
 
 func projectsCreate(c Config, args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: mimir projects create NAME [--member EMAIL ...] [--cpu N] [--memory X] [--pods N]")
+		return fmt.Errorf("usage: mimir projects create NAME [--guarded] [--member EMAIL ...] [--cpu N] [--memory X] [--pods N]")
 	}
 	name := args[0]
 	cpu, mem, pods := "4", "8Gi", "20"
+	guarded := false
 	var members []string
 	for i := 1; i < len(args); i++ {
 		next := func() string { i++; return args[i] }
@@ -788,6 +792,8 @@ func projectsCreate(c Config, args []string) error {
 			mem = next()
 		case "--pods":
 			pods = next()
+		case "--guarded":
+			guarded = true
 		}
 	}
 	// Auto-add the caller so the creator is admin in their own namespace (the RGD binds members -> admin;
@@ -799,7 +805,7 @@ func projectsCreate(c Config, args []string) error {
 		"apiVersion": "kro.run/v1alpha1", "kind": "Project",
 		"metadata": map[string]any{"name": name},
 		"spec": map[string]any{
-			"displayName": name, "members": members,
+			"displayName": name, "members": members, "guarded": guarded,
 			"quota": map[string]any{"cpu": cpu, "memory": mem, "pods": pods},
 		},
 	}
@@ -811,7 +817,41 @@ func projectsCreate(c Config, args []string) error {
 	if code >= 300 {
 		return apiErr(b, code)
 	}
-	fmt.Printf("project %q created\n", name)
+	if guarded {
+		fmt.Printf("project %q created (guarded: Kata-enforced, PSA restricted, egress-locked)\n", name)
+	} else {
+		fmt.Printf("project %q created\n", name)
+	}
+	return nil
+}
+
+// projectsGuard flips spec.guarded on an existing Project (a JSON merge patch; kro re-renders the namespace with
+// the guarded label + PSA + egress + LimitRange, or strips them). `--off` un-guards. This is how you grant an
+// existing project to an untrusted agent/peer after the fact.
+func projectsGuard(c Config, args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: mimir projects guard NAME [--off]")
+	}
+	name := args[0]
+	on := true
+	for _, a := range args[1:] {
+		if a == "--off" {
+			on = false
+		}
+	}
+	patch, _ := json.Marshal(map[string]any{"spec": map[string]any{"guarded": on}})
+	b, code, err := k8sReqCT(c, "PATCH", projPath+"/"+name, patch, "application/merge-patch+json")
+	if err != nil {
+		return err
+	}
+	if code >= 300 {
+		return apiErr(b, code)
+	}
+	if on {
+		fmt.Printf("project %q is now guarded (Kata-enforced, PSA restricted, egress-locked)\n", name)
+	} else {
+		fmt.Printf("project %q is now unguarded\n", name)
+	}
 	return nil
 }
 
