@@ -617,15 +617,26 @@ func projectsCmd(args []string) error {
 		}
 		var l struct {
 			Items []struct {
-				Metadata struct{ Name string }        `json:"metadata"`
-				Spec     struct{ DisplayName string } `json:"spec"`
-				Status   struct{ State string }       `json:"status"`
+				Metadata struct{ Name string } `json:"metadata"`
+				Spec     struct {
+					DisplayName string `json:"displayName"`
+					Tier        string `json:"tier"`
+					Guarded     bool   `json:"guarded"`
+				} `json:"spec"`
+				Status struct{ State string } `json:"status"`
 			} `json:"items"`
 		}
 		_ = json.Unmarshal(b, &l)
-		fmt.Printf("%-24s %-16s %s\n", "NAME", "STATE", "DISPLAY")
+		// TIER/GUARDED are the tenancy posture — the whole point of surfacing projects here: `platform` is a
+		// trusted first-party app (uncapped, no netpol), `tenant` is capped+firewalled, `kata` is hard tenancy.
+		fmt.Printf("%-22s %-10s %-10s %-9s %s\n", "NAME", "STATE", "TIER", "ISOLATION", "DISPLAY")
 		for _, it := range l.Items {
-			fmt.Printf("%-24s %-16s %s\n", it.Metadata.Name, it.Status.State, it.Spec.DisplayName)
+			iso := "shared"
+			if it.Spec.Guarded {
+				iso = "kata"
+			}
+			fmt.Printf("%-22s %-10s %-10s %-9s %s\n",
+				it.Metadata.Name, dash(it.Status.State), dash(it.Spec.Tier), iso, it.Spec.DisplayName)
 		}
 		return nil
 	case "delete":
