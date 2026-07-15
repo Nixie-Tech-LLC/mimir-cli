@@ -1,0 +1,70 @@
+# Build, attest and publish the mimir CLI on `vX.Y.Z` tags.
+#
+# THIS FILE IS MAINTAINED HERE, NOT MIRRORED. Everything else in this repo
+# (cmd/, go.mod, install.sh, README.md, .goreleaser.yaml) is pushed from the
+# Nixie-Tech-LLC/mimir private monorepo by its release-cli workflow, which also
+# pushes the tag that triggers this run. It cannot push THIS file: the
+# integration-runners App has `contents: write` but no `workflows: write`, so a
+# mirrored workflow change would be rejected. Edit it here.
+#
+# Why the build lives in this repo rather than the monorepo that owns the source:
+# GitHub records a build-provenance attestation against the repo that BUILT the
+# artifact. Built in the private monorepo, provenance for these public artifacts
+# would be recorded against a repo that the people downloading them cannot read —
+# and would not be available at all, since attestations are public-repos-only on a
+# Team plan. Built here it is free, and anyone can run:
+#
+#   gh attestation verify mimir_X.Y.Z_linux_amd64.tar.gz --repo Nixie-Tech-LLC/mimir-cli
+#
+# Runs on GitHub-hosted runners ON PURPOSE. The org has ARC self-hosted runners in
+# its cluster, and they must never be attached to a public repo: a fork PR would
+# execute arbitrary code on that infrastructure.
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # create the release + upload assets
+  id-token: write # OIDC identity for the provenance attestation
+  attestations: write # write the attestation to this repo
+
+jobs:
+  release:
+    name: build + attest + publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0 # goreleaser reads tags
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.23"
+          cache: false
+
+      # .goreleaser.yaml's `sboms` block shells out to syft; without it the SBOM
+      # stage fails the release.
+      - name: Install syft (for the CycloneDX SBOMs)
+        uses: anchore/sbom-action/download-syft@v0
+
+      # No token plumbing: the release lands in THIS repo, so the default
+      # GITHUB_TOKEN suffices. Tags here are plain semver, so none of the
+      # monorepo's tag-prefix workarounds are needed either.
+      - uses: goreleaser/goreleaser-action@v6
+        with:
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # The point of building here. Attests the archives users actually download;
+      # `dist/` also holds raw binaries and SBOMs, which are not the subjects.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.zip
