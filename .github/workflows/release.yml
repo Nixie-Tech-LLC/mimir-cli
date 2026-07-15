@@ -3,9 +3,14 @@
 # THIS FILE IS MAINTAINED HERE, NOT MIRRORED. Everything else in this repo
 # (cmd/, go.mod, install.sh, README.md, .goreleaser.yaml) is pushed from the
 # Nixie-Tech-LLC/mimir private monorepo by its release-cli workflow, which also
-# pushes the tag that triggers this run. It cannot push THIS file: the
-# integration-runners App has `contents: write` but no `workflows: write`, so a
-# mirrored workflow change would be rejected. Edit it here.
+# pushes the tag that triggers this run.
+#
+# That workflow COULD push this file — the integration-runners App now carries
+# `workflows: write` — but deliberately does not, and should not start. This is
+# the workflow that builds and signs the artifacts. Mirroring it would place the
+# signer inside the blast radius of the job that feeds it: a compromised
+# release-cli could rewrite this build, and the provenance attestation would
+# faithfully certify the tampered result. Edit it here.
 #
 # Why the build lives in this repo rather than the monorepo that owns the source:
 # GitHub records a build-provenance attestation against the repo that BUILT the
