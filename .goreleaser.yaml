@@ -1,0 +1,129 @@
+version: 2
+
+# Build + release config for the mimir CLI.
+#
+# SOURCE OF TRUTH LIVES HERE; IT RUNS SOMEWHERE ELSE. The release-cli workflow
+# mirrors this file to the PUBLIC repo Nixie-Tech-LLC/mimir-cli as
+# `.goreleaser.yaml`, and mimir-cli's own `.github/workflows/release.yml` runs it
+# there, on GitHub-hosted runners. Nothing in this monorepo executes goreleaser.
+#
+# Why the build lives in the public repo: GitHub records a build-provenance
+# attestation against the repo that BUILT the artifact. Built here, provenance for
+# public artifacts would be recorded against a private repo — unreadable by the
+# very users it is meant to protect, and unavailable anyway (attestations are
+# public-repos-only on our Team plan). Built in mimir-cli, it is free and anyone
+# can run `gh attestation verify <file> --repo Nixie-Tech-LLC/mimir-cli`.
+#
+# Why NOT on our ARC runners: mimir-cli is public, and self-hosted runners on a
+# public repo let a fork PR execute arbitrary code on our cluster. lait is public
+# and builds on ubuntu-latest for exactly this reason.
+#
+# Consequence worth noting: over in mimir-cli the tags are plain semver (`v0.2.7`),
+# so none of the old monorepo tag plumbing is needed — no `GORELEASER_CURRENT_TAG`,
+# no `--skip=validate`, no Pro-only `monorepo.tag_prefix` workaround. That
+# machinery is gone.
+#
+# There is no `dir:` — `main: ./cmd/mimir` resolves against the working directory,
+# which is the repo root in mimir-cli. To exercise it from THIS repo, run it from
+# `cli/` (and hand it a semver tag, since the monorepo's are `cli/vX.Y.Z`):
+#
+#   cd cli && GORELEASER_CURRENT_TAG=v0.0.0 \
+#     goreleaser release --snapshot --clean --skip=validate --config .goreleaser.yaml
+#
+# The asset names below are a COMPATIBILITY CONTRACT, not a preference — they
+# reproduce exactly what release.sh produced, because three things already parse
+# them and would break silently on a rename:
+#   - cli/install.sh              builds `mimir_${ver}_${os}_${arch}.tar.gz` by hand
+#   - the Scoop manifest          pins the windows_amd64.zip URL + its autoupdate template
+#   - the Homebrew formula        pins all four unix tarball URLs
+# Archives are flat (binary at the archive root) and unix uses .tar.gz — keep all
+# of it in lockstep if you change any of it.
+
+project_name: mimir
+
+before:
+  hooks:
+    - go mod download
+
+builds:
+  - id: mimir
+    main: ./cmd/mimir
+    binary: mimir
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    # Matches main.go's `-X main.version/commit/date` injection points.
+    ldflags:
+      - -s -w -X main.version={{ .Version }} -X main.commit={{ .ShortCommit }} -X main.date={{ .Date }}
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+    ignore:
+      # release.sh never shipped windows/arm64; don't start silently.
+      - goos: windows
+        goarch: arm64
+
+archives:
+  - id: mimir
+    ids: [mimir]
+    # -> mimir_0.2.4_linux_amd64.tar.gz  (see the contract note above)
+    name_template: "mimir_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    # `none*` = binary only, no README/LICENSE. Matches release.sh's archives;
+    # the Scoop `bin` and Homebrew `bin.install` both assume a flat root.
+    files:
+      - none*
+
+checksum:
+  # Deliberately `checksums.txt`, not GoReleaser's default
+  # `mimir_0.2.4_checksums.txt` — the publishers grep this filename out of the
+  # release to stamp the Homebrew formula and Scoop manifest.
+  name_template: checksums.txt
+  algorithm: sha256
+
+# Software Bill of Materials: one CycloneDX doc per archive, uploaded alongside
+# it. Requires `syft` on PATH — mimir-cli's release.yml installs it.
+#
+# CycloneDX (not goreleaser's SPDX default) to match what lait publishes, so both
+# CLIs answer supply-chain questions in the same format.
+#
+# Note lait's scar tissue here: cargo-dist's built-in `cargo-cyclonedx = true` is
+# broken upstream (it templates `steps.*.output.paths` instead of `outputs`), so
+# the SBOM silently rendered to an empty path and never reached the release. A
+# config that *looks* right is not evidence — verify a .cdx.json actually lands on
+# the release, e.g. `goreleaser release --snapshot --clean` and inspect dist/.
+sboms:
+  - id: archives
+    artifacts: archive
+    documents: ["${artifact}.cdx.json"]
+    cmd: syft
+    args: ["$artifact", "--output", "cyclonedx-json=$document"]
+
+# mimir-cli's history is a squashed mirror of the monorepo's CLI changes, so an
+# auto-generated changelog would just be a list of "mimir vX.Y.Z" commits. Release
+# notes come from `release.header` until cli/CHANGELOG.md exists.
+changelog:
+  disable: true
+
+release:
+  # Redundant now that this runs inside mimir-cli (goreleaser would default to the
+  # current repo), but kept explicit: it is the only line stating where artifacts
+  # land, and this file is read from the monorepo more often than from mimir-cli.
+  github:
+    owner: Nixie-Tech-LLC
+    name: mimir-cli
+  name_template: "mimir v{{ .Version }}"
+  header: |
+    Self-contained mimir platform CLI (device-flow login, RBAC-gated projects).
+  # Re-running a release replaces its assets instead of erroring, which is what
+  # release.sh's `gh release create || gh release upload --clobber` fallback did.
+  mode: replace
+
+snapshot:
+  # `goreleaser release --snapshot --clean --config cli/.goreleaser.yaml` builds
+  # every target locally without touching git or GitHub. Use it to check this
+  # file before tagging.
+  version_template: "{{ incpatch .Version }}-snapshot"
